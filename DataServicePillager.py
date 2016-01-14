@@ -66,7 +66,6 @@ def output_msg(msg, severity=0):
 
 def gentoken(username, password, referer, expiration=240):
     """ Get access token.
-
         :param username: valid username
         :param passowrd: valid password
         :param referer: valid referer url (eg "https://www.arcgis.com")
@@ -102,14 +101,15 @@ def get_data(query):
         Automatically retries up to max_tries times.
     """
     global count_tries
-    max_tries = 5
+    global max_tries
+    global sleep_time
     try:
         response = urllib2.urlopen(query).read()
         return response
     except Exception, e:
         output_msg(str(e),severity=1)
         # sleep and try again
-        time.sleep(5)
+        time.sleep(sleep_time)
         count_tries += 1
         if count_tries > max_tries:
             count_tries = 0
@@ -166,10 +166,15 @@ def main():
         # arcgis toolbox parameters
         service_endpoint = arcpy.GetParameterAsText(0) # Service endpoint
         output_workspace = arcpy.GetParameterAsText(1) # folder to put the results
-        username = arcpy.GetParameterAsText(2) # optional
-        password = arcpy.GetParameterAsText(3) # optional
-        referring_domain = arcpy.GetParameterAsText(4) # optional
-        existing_token = arcpy.GetParameterAsText(5) # optional
+        max_tries = arcpy.GetParameter(2) # required - max number of retries allowed
+        sleep_time = arcpy.GetParameter(3) # required - max number of retries allowed
+        username = arcpy.GetParameterAsText(4) # optional
+        password = arcpy.GetParameterAsText(5) # optional
+        referring_domain = arcpy.GetParameterAsText(6) # optional
+        existing_token = arcpy.GetParameterAsText(7) # optional
+
+
+        # to query by geometry need [xmin,ymin,xmax,ymax], spatial reference, and geometryType (eg esriGeometryEnvelope
 
         if service_endpoint == '':
             output_msg("Avast! Can't plunder nothing from an empty url! Time to quit.")
@@ -187,6 +192,9 @@ def main():
             output_folder = output_desc.path
 
         token = existing_token # if not supplied is ''
+
+        if not max_tries: # set default
+            max_tries = 5
 
         if username:
             # set referring domain if supplied
@@ -220,19 +228,24 @@ def main():
 
             authhandler = urllib2.HTTPBasicAuthHandler(passman)
             # create the AuthHandler
-
             opener = urllib2.build_opener(authhandler)
+            # user agent spoofing
+            opener.addheaders = [('User-agent', 'Mozilla/5.0')]
 
             urllib2.install_opener(opener)
             # All calls to urllib2.urlopen will now use our handler
             # Make sure not to include the protocol in with the URL, or
             # HTTPPasswordMgrWithDefaultRealm will be very confused.
             # You must (of course) use it when fetching the page though.
-
             # authentication is now handled automatically in urllib2.urlopen
 
             # need to generate a new token
             token = gentoken(username, password, refer)
+        else:
+            #build a generic opener with the use agent spoofed
+            opener = urllib2.build_opener()
+            opener.addheaders = [('User-agent', 'Mozilla/5.0')]
+            urllib2.install_opener(opener)
 
         if username and (token == ""):
             output_msg("Avast! The scurvy gatekeeper says 'Could not generate a token with the username and password provided'.", severity=2)
@@ -266,8 +279,11 @@ def main():
                 final_geofile = ''
 
                 output_msg("Now pillagin' yer data from {0}".format(slyr))
+                if slyr == service_endpoint: # no need to get it again
+                    service_info = service_layer_info
+                else:
+                    service_info = json.loads(urllib2.urlopen(slyr + '?f=json&token=' + token).read())
 
-                service_info = json.loads(urllib2.urlopen(slyr + '?f=json&token=' + token).read())
                 if not service_info.get('error'):
                     service_name = service_info.get('name')
 
@@ -300,6 +316,8 @@ def main():
                                     objectid_field = field.get('name')
                                     break
 
+                            # to query using geometry,&geometry=   &geometryType= esriGeometryEnvelope &inSR= and probably spatial relationship and buffering
+
                             feat_count_query = r"/query?where=" + objectid_field + r"+%3E+0&objectIds=&time=&geometry=&geometryType=esriGeometryEnvelope&inSR=&spatialRel=esriSpatialRelIntersects&distance=&units=esriSRUnit_Meter&outFields=&returnGeometry=false&maxAllowableOffset=&geometryPrecision=&outSR=&returnIdsOnly=false&returnCountOnly=true&returnExtentOnly=false&orderByFields=&groupByFieldsForStatistics=&outStatistics=&resultOffset=&resultRecordCount=&returnZ=false&returnM=false&f=pjson&token=" + token
                             feat_OIDLIST_query = r"/query?where=" + objectid_field + r"+%3E+0&objectIds=&time=&geometry=&geometryType=esriGeometryEnvelope&inSR=&spatialRel=esriSpatialRelIntersects&distance=&units=esriSRUnit_Meter&outFields=&returnGeometry=false&maxAllowableOffset=&geometryPrecision=&outSR=&returnIdsOnly=true&returnCountOnly=false&returnExtentOnly=false&orderByFields=&groupByFieldsForStatistics=&outStatistics=&resultOffset=&resultRecordCount=&returnZ=false&returnM=false&f=pjson&token=" + token
                             feat_query = r"/query?objectIds=&time=&geometry=&geometryType=esriGeometryEnvelope&inSR=&spatialRel=esriSpatialRelIntersects&distance=&units=esriSRUnit_Meter&outFields=*&returnGeometry=true&maxAllowableOffset=&geometryPrecision=&outSR=&returnIdsOnly=false&returnCountOnly=false&returnExtentOnly=false&orderByFields=&groupByFieldsForStatistics=&outStatistics=&resultOffset=&resultRecordCount=&returnZ=false&returnM=false&f=pjson&token=" + token
@@ -316,6 +334,8 @@ def main():
                                 feature_OIDs.sort()
                                 # chunk them
                                 for group in grouper(feature_OIDs, max_record_count):
+                                    # reset count_tries
+                                    count_tries = 0
                                     start_oid = group[0]
                                     end_oid = group[max_record_count-1]
                                     if end_oid is None: # reached the end of the iterables
@@ -410,6 +430,7 @@ def main():
     except Exception, e:
         output_msg("ERROR: " + str(e), severity=2)
         output_msg(arcpy.GetMessages())
+
     finally:
         end_time = datetime.datetime.today()
         elapsed_time = end_time - start_time
