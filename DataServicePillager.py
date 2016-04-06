@@ -113,7 +113,7 @@ def gentoken(username, password, referer, expiration=240):
 
 def get_data(query):
     """ Download the data.
-        Returns a unicode string (utf-8)
+        Return a JSON object
         Automatically retries up to max_tries times.
     """
     global count_tries
@@ -128,19 +128,27 @@ def get_data(query):
                 response = response.decode('utf-8') # convert to unicode
             except UnicodeDecodeError:
                 response = response.decode('unicode-escape') # convert to unicode
-        return response
+            #load to json and check for error
+            resp_json = json.loads(response)
+            if resp_json.get('error'):
+                output_msg(resp_json['error'])
+                response = None
+            else:
+                return resp_json
+        else:
+            return None
 
     except Exception, e:
         output_msg(str(e),severity=1)
         # sleep and try again
-        if e.errno == 10054:
-            #connection forcible closed, extra sleep pause
-            time.sleep(sleep_time)
+        if hasattr(e, 'errno') and e.errno == 10054:
+                #connection forcible closed, extra sleep pause
+                time.sleep(sleep_time)
         time.sleep(sleep_time)
         count_tries += 1
         if count_tries > max_tries:
             count_tries = 0
-            return u"ACCESS_FAILED"
+            return u'{"error": "ACCESS_FAILED"}'
         else:
             output_msg("Attempt {0} of {1}".format(count_tries, max_tries))
             return get_data(query)
@@ -196,13 +204,14 @@ def main():
     try:
         # arcgis toolbox parameters
         service_endpoint = arcpy.GetParameterAsText(0) # Service endpoint
-        output_workspace = arcpy.GetParameterAsText(1) # folder to put the results
+        output_workspace = arcpy.GetParameterAsText(1) # gdb/folder to put the results
         max_tries = arcpy.GetParameter(2) # max number of retries allowed
         sleep_time = arcpy.GetParameter(3) # max number of retries allowed
         username = arcpy.GetParameterAsText(4)
         password = arcpy.GetParameterAsText(5)
         referring_domain = arcpy.GetParameterAsText(6) # auth domain
         existing_token = arcpy.GetParameterAsText(7) # valid token value
+        strict_mode = arcpy.GetParameter(7) # JSON check required True/False
 
         # to query by geometry need [xmin,ymin,xmax,ymax], spatial reference, and geometryType (eg esriGeometryEnvelope
 
@@ -210,7 +219,7 @@ def main():
             output_msg("Avast! Can't plunder nothing from an empty url! Time to quit.")
             sys.exit()
 
-        if not type(max_tries) is int: # set default
+        if not type(max_tries) is int:
             max_tries = int(max_tries)
 
         if not type(sleep_time) is int:
@@ -275,6 +284,9 @@ def main():
             # You must (of course) use it when fetching the page though.
             # authentication is now handled automatically in urllib2.urlopen
 
+            # add proxy handling?
+            # issue where a proxy may not be picked up
+
             # need to generate a new token
             token = gentoken(username, password, refer)
         else:
@@ -297,6 +309,11 @@ def main():
                 service_layer_info = json.loads(service_call, strict=False)
             else:
                 raise Exception("'service_call' failed to access {0}".format(service_endpoint))
+
+            # catch root url entered
+            service_list = service_layer_info.get('services')
+            if service_list: 
+                raise ValueError("Unable to pillage a service root url at this time. Enter a FeatureServer layer url!")
 
             # for getting all the layers
             service_layers = service_layer_info.get('layers')
@@ -336,25 +353,30 @@ def main():
 
                     # clean up the service name (remove invalid characters)
                     service_name_cl = service_name.encode('ascii', 'ignore') # strip any non-ascii characters that may cause an issue
-                    service_name_cl = arcpy.ValidateTableName(service_name) # remove any other problematic characters
-                    output_msg("'{0}' will be stashed as '{1}'".format(service_name, service_name_cl))
+                    service_name_cl = arcpy.ValidateTableName(service_name, output_workspace) # remove any other problematic characters
+                    ##output_msg("'{0}' will be stashed as '{1}'".format(service_name, service_name_cl))
 
                     # write out the service info for reference
                     info_filename = service_name_cl + "_info.txt"
                     info_file = os.path.join(output_folder, info_filename)
                     with open(info_file, 'w') as f:
                         json.dump(service_info, f, sort_keys=True, indent=4, separators=(',', ': '))
-                        output_msg("Yar! Service info stashed: {0}".format(info_file))
+                        output_msg("Yar! {0} Service info stashed in '{1}'".format(service_name, info_file))
 
-                    supports_json = False
-                    if 'supportedQueryFormats' in service_info:
-                        supported_formats = service_info.get('supportedQueryFormats').split(",")
-                        for data_format in supported_formats:
-                            if data_format == "JSON":
-                                supports_json = True
-                                break
+                    if strict_mode:
+                        # check JSON supported
+                        supports_json = False
+                        if 'supportedQueryFormats' in service_info:
+                            supported_formats = service_info.get('supportedQueryFormats').split(",")
+                            for data_format in supported_formats:
+                                if data_format == "JSON":
+                                    supports_json = True
+                                    break
+                        else:
+                            output_msg('Unable to check supported formats. Check {0} for details'.format(info_file))
                     else:
-                        output_msg('Unable to check supported formats')
+                        # assume JSON supported
+                        supports_json = True
 
                     if supports_json == True:
                         try:
@@ -369,21 +391,21 @@ def main():
                             else:
                                 output_msg("No field list returned - forging ahead with {0}".format(objectid_field))
 
-                            # to query using geometry,&geometry=   &geometryType= esriGeometryEnvelope &inSR= and probably spatial relationship and buffering
-
-                            feat_count_query = r"/query?where=" + objectid_field + r"+%3E+0&objectIds=&time=&geometry=&geometryType=esriGeometryEnvelope&inSR=&spatialRel=esriSpatialRelIntersects&distance=&units=esriSRUnit_Meter&outFields=&returnGeometry=false&maxAllowableOffset=&geometryPrecision=&outSR=&returnIdsOnly=false&returnCountOnly=true&returnExtentOnly=false&orderByFields=&groupByFieldsForStatistics=&outStatistics=&resultOffset=&resultRecordCount=&returnZ=false&returnM=false&f=json&token=" + token
                             feat_OIDLIST_query = r"/query?where=" + objectid_field + r"+%3E+0&objectIds=&time=&geometry=&geometryType=esriGeometryEnvelope&inSR=&spatialRel=esriSpatialRelIntersects&distance=&units=esriSRUnit_Meter&outFields=&returnGeometry=false&maxAllowableOffset=&geometryPrecision=&outSR=&returnIdsOnly=true&returnCountOnly=false&returnExtentOnly=false&orderByFields=&groupByFieldsForStatistics=&outStatistics=&resultOffset=&resultRecordCount=&returnZ=false&returnM=false&f=json&token=" + token
+
+                            # to query using geometry,&geometry=   &geometryType= esriGeometryEnvelope &inSR= and probably spatial relationship and buffering
                             feat_query = r"/query?objectIds=&time=&geometry=&geometryType=esriGeometryEnvelope&inSR=&spatialRel=esriSpatialRelIntersects&distance=&units=esriSRUnit_Meter&outFields=*&returnGeometry=true&maxAllowableOffset=&geometryPrecision=&outSR=&returnIdsOnly=false&returnCountOnly=false&returnExtentOnly=false&orderByFields=&groupByFieldsForStatistics=&outStatistics=&resultOffset=&resultRecordCount=&returnZ=false&returnM=false&f=json&token=" + token
 
                             max_record_count = service_info.get('maxRecordCount') # maximum number of records returned by service at once
-                            feature_count = json.loads(urllib2.urlopen(slyr + feat_count_query).read())["count"]
-                            sortie_count = feature_count//max_record_count + (feature_count % max_record_count > 0)
-                            output_msg("{0} records, in chunks of {1}, err, that be {2} sorties".format(feature_count, max_record_count, sortie_count))
 
                             # extract using actual OID values is the safest way
                             feature_OIDs = json.loads(urllib2.urlopen(slyr + feat_OIDLIST_query).read())["objectIds"]
 
                             if feature_OIDs:
+                                feature_count = len(feature_OIDs)
+                                sortie_count = feature_count//max_record_count + (feature_count % max_record_count > 0)
+                                output_msg("{0} records, in chunks of {1}, err, that be {2} sorties. Ready lads!".format(feature_count, max_record_count, sortie_count))
+
                                 feature_OIDs.sort()
                                 # chunk them
                                 for group in grouper(feature_OIDs, max_record_count):
@@ -403,36 +425,39 @@ def main():
                                     where_clause = "&where={0}+%3E%3D+{1}+AND+{2}+%3C%3D+{3}".format(objectid_field, str(start_oid), objectid_field, str(end_oid))
                                     # response is a string of json with the attr and geom
                                     query = slyr + feat_query + where_clause
-                                    response = get_data(query) # expects unicode
-                                    if not response or (response == 'ACCESS_FAILED'):
+                                    response = get_data(query) # expects json object. An error will return none
+                                    if not response or not response.get('features'):
                                         # break out
                                         raise ValueError("Abandon ship! Data access failed! Check what ye manag'd to plunder before failure.")
                                     else:
-                                        feature_dict = json.loads(response, strict=False)["features"] # load the features so we can check they are not empty
+                                        feature_dict = response["features"] # load the features so we can check they are not empty
 
                                         if len(feature_dict) != 0:
                                             # convert response to json file on disk then to shapefile (is fast)
                                             out_JSON_name = service_name_cl + "_" + str(current_iter) + ".json"
                                             out_JSON_file = os.path.join(output_folder, out_JSON_name)
 
-                                            # in-memory version
-                                            ##temp_output = "in_memory\\"
-                                            ##out_file_name = service_name_cl + "_" + str(current_iter)
-                                            ##out_geofile = os.path.join(temp_output, out_file_name)
+                                            #with open(out_JSON_file, 'w') as out_file:
+                                            #    out_file.write(response.encode('utf-8')) #back from unicode
+
+                                            with open(out_JSON_file, 'w') as out_file:
+                                                data = json.dumps(response, ensure_ascii=False, encoding='utf-8')
+                                                out_file.write(data)
+
+                                            output_msg("Nabbed some json data fer ye: '{0}', oids {1} to {2}".format(out_JSON_name, start_oid, end_oid))
 
                                             if output_type == "Folder":
                                                 out_file_name = service_name_cl + "_" + str(current_iter) + ".shp"
                                             else:
                                                 out_file_name = service_name_cl + "_" + str(current_iter)
+                                            # in-memory version
+                                            ##temp_output = "in_memory\\"
+                                            ##out_file_name = service_name_cl + "_" + str(current_iter)
+                                            ##out_geofile = os.path.join(temp_output, out_file_name)
 
                                             out_geofile = os.path.join(output_workspace, out_file_name)
 
-                                            with open(out_JSON_file, 'w') as out_file:
-                                                out_file.write(response.encode('utf-8')) #back from unicode
-
-                                            # write temp output
-                                            output_msg("Nabbed some data fer ye: '{0}', oids {1} to {2}".format(out_file_name, start_oid, end_oid))
-
+                                            output_msg("Converting json to {0}".format(out_geofile))
                                             arcpy.JSONToFeatures_conversion(out_JSON_file, out_geofile)
                                             out_shapefile_list.append(out_geofile)
                                             os.remove(out_JSON_file) # clean up the JSON file
@@ -488,7 +513,7 @@ def main():
         output_msg("ERROR: " + str(e), severity=2)
 
     except Exception, e:
-        if e.errno == 10054:
+        if hasattr(e, 'errno') and e.errno == 10054:
             output_msg("ERROR: " + str(e), severity=2)
         else:
             line, err = trace()
